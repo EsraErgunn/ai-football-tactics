@@ -50,8 +50,10 @@ import tempfile
 import traceback
 import uuid
 from collections import deque
+from datetime import datetime
 from typing import Dict, Generator, List, Optional
 
+import cv2
 import numpy as np
 import supervision as sv
 import torch
@@ -68,6 +70,7 @@ from fastapi.responses import FileResponse
 from tqdm import tqdm
 
 from inference import get_model
+from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
 from sports.common.team import TeamClassifier
 from sports.common.view import ViewTransformer
 from sports.configs.soccer import SoccerPitchConfiguration
@@ -77,8 +80,8 @@ from sports.configs.soccer import SoccerPitchConfiguration
 # Anahtarlari koda yazma; terminalden veya .env'den tanimla.
 # setdefault: sistemde tanimliysa onu kullanir, degilse buradakini.
 # ----------------------------------------------------------------------------
-os.environ.setdefault("HF_TOKEN", "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")
-os.environ.setdefault("ROBOFLOW_API_KEY", "JZdnCH77nG3xptztjHoD")
+os.environ.setdefault("HF_TOKEN", "BURAYA_YENI_HF_TOKEN")
+os.environ.setdefault("ROBOFLOW_API_KEY", "BURAYA_YENI_ROBOFLOW_KEY")
 os.environ["ONNXRUNTIME_EXECUTION_PROVIDERS"] = "[CPUExecutionProvider]"
 
 ROBOFLOW_API_KEY = os.environ["ROBOFLOW_API_KEY"]
@@ -120,10 +123,116 @@ VORONOI_STRIDE = 5               # Kac islenen karede bir Voronoi izgarasi gonde
 VORONOI_GRID = (60, 40)          # (uzunluk, genislik) hucre sayisi
 HEATMAP_GRID = (60, 40)
 
+# --- TAKIPCI (TRACKER) AYARLARI ------------------------------------------------
+TRACKER_BACKEND = "bytetrack"    # "bytetrack" (varsayilan) | "botsort" (gorunum
+                                 # tabanli re-ID; pip install boxmot gerektirir)
+TRACK_ACTIVATION_THRESHOLD = 0.30
+LOST_TRACK_SECONDS = 4.0         # Iz kaybolunca ID bu kadar saniye hafizada tutulur;
+                                 # kisa ortusmelerde oyuncu yeni numara ALMAZ.
+MIN_CONSECUTIVE_FRAMES = 1       # 1 = filtre kapali. DIKKAT: 3 denendi ve geri
+                                 # tepti: hizli kosan gercek oyuncular elendi,
+                                 # sabit duran kulube/personel kaldi. Hayalet
+                                 # tespitler artik saha siniri filtresiyle eleniyor.
+PITCH_MARGIN_CM = 200            # Kusbakisi konumu saha disina bu payin otesinde
+                                 # dusen tespitler (yedek kulubesi, kenar personeli,
+                                 # tribun) radara ve istatistige ALINMAZ.
+
+# --- HIZLANDIRMA PARAMETRELERI -----------------------------------------------
+FIELD_DETECT_EVERY = 1           # 1 = her karede (dogru sonuc). 3 denendi:
+                                 # kamera pan yaparken homografi geride kaldi ve
+                                 # koordinatlar kaydi. Hiz icin artirilabilir ama
+                                 # SADECE kameranin cok az hareket ettigi videolarda.
+TEAM_VOTE_FRAMES = 5             # Bir oyuncunun takimi bu kadar oyla KESINLESIR ve
+                                 # sonrasinda o oyuncu icin SigLIP bir daha CALISMAZ.
+                                 # CPU'daki en buyuk maliyet kalemi budur.
+
+# --- RENDER (MP4 cikti) AYARLARI ----------------------------------------------
+RADAR_INSET_RATIO = 0.30         # Mini radarin video genisligine orani
+
+# Render modunda kullanilan cizim araclari (egitmenin stilinde):
+# oyuncular takim renginde elips, top sari ucgen, etiketler "#id".
+ELLIPSE_ANNOTATOR = sv.EllipseAnnotator(
+    color=sv.ColorPalette.from_hex(["#00BFFF", "#FF1493"]), thickness=2
+)
+LABEL_ANNOTATOR = sv.LabelAnnotator(
+    color=sv.ColorPalette.from_hex(["#00BFFF", "#FF1493"]),
+    text_color=sv.Color.from_hex("#000000"),
+)
+TRIANGLE_ANNOTATOR = sv.TriangleAnnotator(
+    color=sv.Color.from_hex("#FFD700"), base=25, height=21, outline_thickness=1
+)
+
 
 # ----------------------------------------------------------------------------
 # YARDIMCI FONKSIYONLAR
 # ----------------------------------------------------------------------------
+class PlayerTracker:
+    """
+    Takipci adaptoru. Iki arka uc destekler:
+
+    - "bytetrack": supervision'in ByteTrack'i, ama STRIDE'A GORE AYARLANMIS.
+      Kritik nokta: frame_rate'e videonun gercek fps'i degil, ISLENEN kare
+      hizi (fps / PROCESS_STRIDE) verilir. Boylece Kalman tahmini, kareler
+      arasi gercek hareket miktarini dogru varsayar ve ID'ler kopmaz.
+
+    - "botsort": boxmot kutuphanesinin BoT-SORT'u. Harekete ek olarak oyuncunun
+      GORUNUMUNE (re-ID embedding) bakar; ortusme sonrasi ayni oyuncuyu taniyip
+      eski ID'sini geri verir. CPU'da kare basina ek maliyet getirir.
+      Kurulum: pip install boxmot  (re-ID agirligi ilk calismada otomatik iner)
+    """
+
+    def __init__(self, effective_fps: float):
+        self.backend = TRACKER_BACKEND
+        if self.backend == "botsort":
+            try:
+                from pathlib import Path as _Path
+                from boxmot import BotSort
+            except ImportError as e:
+                raise RuntimeError(
+                    "TRACKER_BACKEND='botsort' icin once: pip install boxmot"
+                ) from e
+            self.impl = BotSort(
+                reid_weights=_Path("osnet_x0_25_msmt17.pt"),
+                device="cpu",
+                half=False,
+            )
+        else:
+            kwargs = dict(
+                track_activation_threshold=TRACK_ACTIVATION_THRESHOLD,
+                lost_track_buffer=int(LOST_TRACK_SECONDS * 30),
+                minimum_matching_threshold=0.8,
+                frame_rate=max(1, int(round(effective_fps))),
+                minimum_consecutive_frames=MIN_CONSECUTIVE_FRAMES,
+            )
+            try:
+                self.impl = sv.ByteTrack(**kwargs)
+            except TypeError:
+                # Eski supervision surumlerinde minimum_consecutive_frames yok
+                kwargs.pop("minimum_consecutive_frames", None)
+                self.impl = sv.ByteTrack(**kwargs)
+            self.impl.reset()
+
+    def update(self, detections: sv.Detections, frame: np.ndarray) -> sv.Detections:
+        if self.backend != "botsort":
+            return self.impl.update_with_detections(detections)
+
+        if len(detections) == 0:
+            detections.tracker_id = np.array([], dtype=int)
+            return detections
+        dets = np.column_stack(
+            [detections.xyxy, detections.confidence, detections.class_id]
+        ).astype(np.float32)
+        out = self.impl.update(dets, frame)
+        tracker_ids = np.full(len(detections), -1, dtype=int)
+        if out is not None and len(out) > 0:
+            for row in out:
+                src = int(row[7])  # boxmot, girdi tespit indeksini son sutunda verir
+                if 0 <= src < len(detections):
+                    tracker_ids[src] = int(row[4])
+        detections.tracker_id = tracker_ids
+        return detections[tracker_ids != -1]
+
+
 def resolve_goalkeepers_team_id(
     players: sv.Detections, goalkeepers: sv.Detections
 ) -> np.ndarray:
@@ -199,18 +308,40 @@ def fit_team_classifier(video_path: str) -> TeamClassifier:
 # Her islenen kare icin bir "kare" sozlugu uretir (yield), en sonda "ozet".
 # Hem WebSocket canli akisi hem de tek atimlik /analyze ayni motoru kullanir.
 # ----------------------------------------------------------------------------
-def analyze_video_stream(video_path: str) -> Generator[dict, None, None]:
+def analyze_video_stream(
+    video_path: str, render_path: Optional[str] = None
+) -> Generator[dict, None, None]:
+    """
+    render_path verilirse: islenen her kare, uzerine elips/etiket/ucgen ve mini
+    radar cizilerek render_path'teki MP4'e yazilir (VideoSink). Verilmezse
+    sadece veri akisi uretilir (eski davranis).
+    """
     # --- 0) Takim siniflandirici egitimi (uzun surer, frontend'i bilgilendir) -
     yield {"tip": "durum", "mesaj": "Takim siniflandirici egitiliyor...", "asama": 1, "toplam_asama": 2}
     team_classifier = fit_team_classifier(video_path)
     yield {"tip": "durum", "mesaj": "Video analizi basladi", "asama": 2, "toplam_asama": 2}
 
-    tracker = sv.ByteTrack()
-    tracker.reset()
-
     video_info = sv.VideoInfo.from_video_path(video_path)
     fps = video_info.fps if video_info.fps and video_info.fps > 0 else 25
+
+    # Takipci, ISLENEN kare hizina gore kurulur (stride'in ID patlatmasini onler)
+    effective_fps = fps / PROCESS_STRIDE
+    tracker = PlayerTracker(effective_fps)
     frame_generator = sv.get_video_frames_generator(video_path, stride=PROCESS_STRIDE)
+
+    # --- VideoSink: kaynak videonun cozunurlugunu kopyala, FPS'i stride'a bol.
+    # Boylece cikti MP4'un SURESI orijinalle ayni kalir (3 karede 1 yazdigimiz
+    # icin fps/3 ile oynatmak zamani dogru tutar). PROCESS_STRIDE=1 yaparsan
+    # egitmenin anlattigi tam akici (orijinal fps) sonucu alirsin.
+    sink: Optional[sv.VideoSink] = None
+    if render_path:
+        render_info = sv.VideoInfo(
+            width=video_info.width,
+            height=video_info.height,
+            fps=max(1, round(fps / PROCESS_STRIDE)),
+        )
+        sink = sv.VideoSink(target_path=render_path, video_info=render_info)
+        sink.__enter__()
 
     M_queue: deque = deque(maxlen=HOMOGRAPHY_WINDOW)
 
@@ -229,185 +360,296 @@ def analyze_video_stream(video_path: str) -> Generator[dict, None, None]:
     candidate_frames = 0
     last_valid_ball_xy: Optional[np.ndarray] = None
 
+    # HIZLANDIRMA 1: Takim karari onbellegi. tracker_id -> takim (0/1).
+    # Bir oyuncunun takimi TEAM_VOTE_FRAMES oyla kesinlesince SigLIP o oyuncu
+    # icin bir daha calismaz (formasi mac ortasinda degismeyecegine gore).
+    team_cache: Dict[int, int] = {}
+    team_votes: Dict[int, List[int]] = {}
+
+    # HIZLANDIRMA 2: Homografi onbellegi. Saha keypoint modeli her karede degil
+    # FIELD_DETECT_EVERY karede bir calisir; arada son matris kullanilir.
+    cached_transformer: Optional[ViewTransformer] = None
+
     processed_total = max(1, video_info.total_frames // PROCESS_STRIDE)
     frame_idx = 0
 
-    for frame in frame_generator:
-        frame_idx += 1
-        video_time_sec = round(frame_idx * PROCESS_STRIDE / fps, 2)
+    try:
+        for frame in frame_generator:
+            frame_idx += 1
+            video_time_sec = round(frame_idx * PROCESS_STRIDE / fps, 2)
 
-        # --- 1) Oyuncu + top tespiti -----------------------------------------
-        result = PLAYER_DETECTION_MODEL.infer(frame, confidence=DETECTION_CONF)[0]
-        detections = sv.Detections.from_inference(result)
+            # --- 1) Oyuncu + top tespiti -----------------------------------------
+            result = PLAYER_DETECTION_MODEL.infer(frame, confidence=DETECTION_CONF)[0]
+            detections = sv.Detections.from_inference(result)
 
-        ball_detections = detections[detections.class_id == BALL_ID]
-        person_detections = detections[detections.class_id != BALL_ID].with_nms(
-            threshold=0.5, class_agnostic=True
-        )
-
-        # --- 2) ByteTrack takip -----------------------------------------------
-        person_detections = tracker.update_with_detections(detections=person_detections)
-
-        goalkeepers = person_detections[person_detections.class_id == GOALKEEPER_ID]
-        players = person_detections[person_detections.class_id == PLAYER_ID]
-
-        if len(players) == 0:
-            continue
-
-        # --- 3) Takim atamasi (TeamClassifier: SigLIP+UMAP+KMeans iceride) ----
-        player_crops = [sv.crop_image(frame, xyxy) for xyxy in players.xyxy]
-        players.class_id = team_classifier.predict(player_crops)
-        if len(goalkeepers) > 0:
-            goalkeepers.class_id = resolve_goalkeepers_team_id(players, goalkeepers)
-            players = sv.Detections.merge([players, goalkeepers])
-
-        # --- 4) Homografi + 5 karelik puruzsuzlestirme -------------------------
-        field_result = FIELD_DETECTION_MODEL.infer(frame, confidence=DETECTION_CONF)[0]
-        key_points = sv.KeyPoints.from_inference(field_result)
-        mask = key_points.confidence[0] > KEYPOINT_CONF_THRESHOLD
-        if np.sum(mask) < 4:
-            continue
-
-        frame_ref = key_points.xy[0][mask]
-        pitch_ref = np.array(CONFIG.vertices)[mask]
-        transformer = ViewTransformer(source=frame_ref, target=pitch_ref)
-        M_queue.append(transformer.m)
-        transformer.m = np.mean(np.array(M_queue), axis=0)
-
-        # --- 5) Kusbakisi koordinatlar -----------------------------------------
-        pitch_players_xy = transformer.transform_points(
-            points=players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-        )
-        team_ids = players.class_id
-        tracker_ids = players.tracker_id
-
-        pitch_ball_xy = None
-        if len(ball_detections) > 0:
-            best = int(np.argmax(ball_detections.confidence))
-            ball_anchor = ball_detections.get_anchors_coordinates(
-                sv.Position.BOTTOM_CENTER
-            )[best : best + 1]
-            candidate_ball_xy = transformer.transform_points(points=ball_anchor)[0]
-
-            # Outlier temizleme: islenen iki kare arasinda top en fazla
-            # esik * stride kadar yol alabilir; fazlasi hatali tespittir.
-            if (
-                last_valid_ball_xy is None
-                or np.linalg.norm(candidate_ball_xy - last_valid_ball_xy)
-                <= BALL_OUTLIER_THRESHOLD_CM * PROCESS_STRIDE
-            ):
-                pitch_ball_xy = candidate_ball_xy
-                last_valid_ball_xy = candidate_ball_xy
-                ball_path.append(
-                    [round(float(pitch_ball_xy[0]), 1), round(float(pitch_ball_xy[1]), 1)]
-                )
-
-        # --- 6) Isi haritasi birikimi -------------------------------------------
-        for xy, tid in zip(pitch_players_xy, team_ids):
-            heatmap_points[int(tid)].append(
-                [round(float(xy[0]), 1), round(float(xy[1]), 1)]
+            ball_detections = detections[detections.class_id == BALL_ID]
+            person_detections = detections[detections.class_id != BALL_ID].with_nms(
+                threshold=0.5, class_agnostic=True
             )
 
-        # --- 7) PAS / TOPA SAHIP OLMA / TOP KAYBI -------------------------------
-        pass_event = None  # Bu karede pas/top kaybi olduysa frontend'e bildir
-        if pitch_ball_xy is not None:
-            distances = np.linalg.norm(pitch_players_xy - pitch_ball_xy, axis=1)
-            nearest_idx = int(np.argmin(distances))
+            # --- 2) Takip (PlayerTracker: ayarli ByteTrack veya BoT-SORT) ---------
+            person_detections = tracker.update(person_detections, frame)
 
-            if distances[nearest_idx] <= CONTROL_DISTANCE_CM:
-                nearest_team = int(team_ids[nearest_idx])
-                nearest_tracker = (
-                    int(tracker_ids[nearest_idx]) if tracker_ids is not None else -1
-                )
+            goalkeepers = person_detections[person_detections.class_id == GOALKEEPER_ID]
+            players = person_detections[person_detections.class_id == PLAYER_ID]
 
-                possession_frames[nearest_team] += 1
+            if len(players) == 0:
+                continue
 
-                if nearest_tracker == candidate_tracker_id:
-                    candidate_frames += 1
+            # --- 3) Takim atamasi - ONBELLEKLI (HIZLANDIRMA 1) ------------------
+            # Takimi kesinlesmis oyuncular icin SigLIP CALISMAZ; sadece yeni/
+            # oylamasi suren tracker_id'ler icin tahmin yapilir. CPU'daki en
+            # buyuk maliyet kalemi bu oldugu icin kazanc cok buyuktur.
+            tr_list = players.tracker_id
+            assigned = np.zeros(len(players), dtype=int)
+            pending = []  # henuz kesinlesmemis oyuncularin indeksleri
+            for i, tid in enumerate(tr_list):
+                tid = int(tid)
+                if tid in team_cache:
+                    assigned[i] = team_cache[tid]
                 else:
-                    candidate_tracker_id = nearest_tracker
-                    candidate_frames = 1
+                    pending.append(i)
+            if pending:
+                pend_crops = [sv.crop_image(frame, players.xyxy[i]) for i in pending]
+                preds = team_classifier.predict(pend_crops)
+                for i, pred in zip(pending, preds):
+                    tid = int(tr_list[i])
+                    votes = team_votes.setdefault(tid, [])
+                    votes.append(int(pred))
+                    assigned[i] = int(pred)
+                    if len(votes) >= TEAM_VOTE_FRAMES:
+                        # Cogunluk oyu ile kesinlestir, oylamayi kapat
+                        team_cache[tid] = int(np.bincount(votes).argmax())
+                        assigned[i] = team_cache[tid]
+                        team_votes.pop(tid, None)
+            players.class_id = assigned
+            if len(goalkeepers) > 0:
+                goalkeepers.class_id = resolve_goalkeepers_team_id(players, goalkeepers)
+                players = sv.Detections.merge([players, goalkeepers])
 
-                if (
-                    candidate_frames >= MIN_CONTROL_FRAMES
-                    and nearest_tracker != last_holder_tracker_id
-                ):
-                    if last_holder_tracker_id is not None and last_holder_xy is not None:
-                        travel = np.linalg.norm(
-                            pitch_players_xy[nearest_idx] - last_holder_xy
-                        )
-                        if nearest_team == last_holder_team:
-                            if travel >= MIN_PASS_DISTANCE_CM:
-                                passes[nearest_team] += 1
-                                pass_event = {
-                                    "olay": "pas",
-                                    "takim": nearest_team,
-                                    "kimden": last_holder_tracker_id,
-                                    "kime": nearest_tracker,
-                                    "mesafe_cm": round(float(travel), 1),
-                                }
-                        else:
-                            turnovers[last_holder_team] += 1
-                            pass_event = {
-                                "olay": "top_kaybi",
-                                "kaybeden_takim": last_holder_team,
-                                "kazanan_takim": nearest_team,
-                            }
-                    last_holder_tracker_id = nearest_tracker
-                    last_holder_team = nearest_team
-                    last_holder_xy = pitch_players_xy[nearest_idx].copy()
-                elif nearest_tracker == last_holder_tracker_id:
-                    last_holder_xy = pitch_players_xy[nearest_idx].copy()
+            # --- 4) Homografi - SEYREK HESAP (HIZLANDIRMA 2) ---------------------
+            # Saha keypoint modeli her FIELD_DETECT_EVERY karede bir calisir;
+            # kamera yavas dondugu icin aradaki karelerde son matris yeterlidir.
+            # 5 karelik M_queue ortalamasi (egitmenin yontemi) aynen korunur.
+            if cached_transformer is None or (frame_idx - 1) % FIELD_DETECT_EVERY == 0:
+                field_result = FIELD_DETECTION_MODEL.infer(frame, confidence=DETECTION_CONF)[0]
+                key_points = sv.KeyPoints.from_inference(field_result)
+                mask = key_points.confidence[0] > KEYPOINT_CONF_THRESHOLD
+                if np.sum(mask) >= 4:
+                    frame_ref = key_points.xy[0][mask]
+                    pitch_ref = np.array(CONFIG.vertices)[mask]
+                    new_transformer = ViewTransformer(source=frame_ref, target=pitch_ref)
+                    M_queue.append(new_transformer.m)
+                    new_transformer.m = np.mean(np.array(M_queue), axis=0)
+                    cached_transformer = new_transformer
+            if cached_transformer is None:
+                continue  # Henuz hic gecerli homografi kurulamadi
+            transformer = cached_transformer
 
-        # --- 8) Anlik istatistikler ----------------------------------------------
-        total_poss = possession_frames[0] + possession_frames[1]
-        poss_a = round(possession_frames[0] / total_poss * 100, 1) if total_poss else 0.0
-
-        # --- 9) Voronoi izgarasi (toggle icin, seyrek gonder) ----------------------
-        voronoi_payload = None
-        if frame_idx % VORONOI_STRIDE == 0:
-            vgrid = compute_voronoi_grid(
-                pitch_players_xy[team_ids == 0], pitch_players_xy[team_ids == 1]
+            # --- 5) Kusbakisi koordinatlar -----------------------------------------
+            pitch_players_xy = transformer.transform_points(
+                points=players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
             )
-            if vgrid is not None:
-                voronoi_samples.append(float(np.mean(vgrid == 0) * 100.0))
-                voronoi_payload = vgrid.tolist()
+            team_ids = players.class_id
+            tracker_ids = players.tracker_id
 
-        # --- 10) KARE MESAJI: WebSocket'in frontend'e firlatacagi paket ------------
-        yield {
-            "tip": "kare",
-            "kare": frame_idx,
-            "ilerleme_yuzde": round(frame_idx / processed_total * 100, 1),
-            "video_zamani_saniye": video_time_sec,
-            "oyuncular": [
-                {
-                    "id": int(tid) if tid is not None else -1,
-                    "takim": int(team),
-                    "x": round(float(xy[0]), 1),
-                    "y": round(float(xy[1]), 1),
-                }
-                for xy, team, tid in zip(
-                    pitch_players_xy,
-                    team_ids,
-                    tracker_ids if tracker_ids is not None else [None] * len(team_ids),
+            # --- 5.5) SAHA SINIRI FILTRESI (hayalet tespit cozumu) ----------------
+            # Kusbakisi konumu sahanin (+pay) disina dusen herkes elenir:
+            # yedek kulubesi, kenar personeli, tribun tespitleri radari ve
+            # istatistikleri kirletemez. Dogru filtre budur; ardisik-kare
+            # filtresi (MIN_CONSECUTIVE_FRAMES=3) tam tersini yapiyordu.
+            in_pitch = (
+                (pitch_players_xy[:, 0] >= -PITCH_MARGIN_CM)
+                & (pitch_players_xy[:, 0] <= CONFIG.length + PITCH_MARGIN_CM)
+                & (pitch_players_xy[:, 1] >= -PITCH_MARGIN_CM)
+                & (pitch_players_xy[:, 1] <= CONFIG.width + PITCH_MARGIN_CM)
+            )
+            if not np.any(in_pitch):
+                continue
+            players = players[in_pitch]
+            pitch_players_xy = pitch_players_xy[in_pitch]
+            team_ids = players.class_id
+            tracker_ids = players.tracker_id
+
+            pitch_ball_xy = None
+            if len(ball_detections) > 0:
+                best = int(np.argmax(ball_detections.confidence))
+                ball_anchor = ball_detections.get_anchors_coordinates(
+                    sv.Position.BOTTOM_CENTER
+                )[best : best + 1]
+                candidate_ball_xy = transformer.transform_points(points=ball_anchor)[0]
+
+                # Outlier temizleme: islenen iki kare arasinda top en fazla
+                # esik * stride kadar yol alabilir; fazlasi hatali tespittir.
+                if (
+                    last_valid_ball_xy is None
+                    or np.linalg.norm(candidate_ball_xy - last_valid_ball_xy)
+                    <= BALL_OUTLIER_THRESHOLD_CM * PROCESS_STRIDE
+                ):
+                    pitch_ball_xy = candidate_ball_xy
+                    last_valid_ball_xy = candidate_ball_xy
+                    ball_path.append(
+                        [round(float(pitch_ball_xy[0]), 1), round(float(pitch_ball_xy[1]), 1)]
+                    )
+
+            # --- 6) Isi haritasi birikimi -------------------------------------------
+            for xy, tid in zip(pitch_players_xy, team_ids):
+                heatmap_points[int(tid)].append(
+                    [round(float(xy[0]), 1), round(float(xy[1]), 1)]
                 )
-            ],
-            "top": (
-                {"x": round(float(pitch_ball_xy[0]), 1), "y": round(float(pitch_ball_xy[1]), 1)}
-                if pitch_ball_xy is not None
-                else None
-            ),
-            "topu_kontrol_eden": {
-                "oyuncu_id": last_holder_tracker_id,
-                "takim": last_holder_team,
-            },
-            "olay": pass_event,
-            "istatistik": {
-                "takim_A": {"pas": passes[0], "top_kaybi": turnovers[0], "topa_sahip_olma_yuzde": poss_a},
-                "takim_B": {"pas": passes[1], "top_kaybi": turnovers[1], "topa_sahip_olma_yuzde": round(100 - poss_a, 1) if total_poss else 0.0},
-            },
-            "voronoi_izgara": voronoi_payload,  # null degilse radarin uzerine bindir
-        }
+
+            # --- 7) PAS / TOPA SAHIP OLMA / TOP KAYBI -------------------------------
+            pass_event = None  # Bu karede pas/top kaybi olduysa frontend'e bildir
+            if pitch_ball_xy is not None:
+                distances = np.linalg.norm(pitch_players_xy - pitch_ball_xy, axis=1)
+                nearest_idx = int(np.argmin(distances))
+
+                if distances[nearest_idx] <= CONTROL_DISTANCE_CM:
+                    nearest_team = int(team_ids[nearest_idx])
+                    nearest_tracker = (
+                        int(tracker_ids[nearest_idx]) if tracker_ids is not None else -1
+                    )
+
+                    possession_frames[nearest_team] += 1
+
+                    if nearest_tracker == candidate_tracker_id:
+                        candidate_frames += 1
+                    else:
+                        candidate_tracker_id = nearest_tracker
+                        candidate_frames = 1
+
+                    if (
+                        candidate_frames >= MIN_CONTROL_FRAMES
+                        and nearest_tracker != last_holder_tracker_id
+                    ):
+                        if last_holder_tracker_id is not None and last_holder_xy is not None:
+                            travel = np.linalg.norm(
+                                pitch_players_xy[nearest_idx] - last_holder_xy
+                            )
+                            if nearest_team == last_holder_team:
+                                if travel >= MIN_PASS_DISTANCE_CM:
+                                    passes[nearest_team] += 1
+                                    pass_event = {
+                                        "olay": "pas",
+                                        "takim": nearest_team,
+                                        "kimden": last_holder_tracker_id,
+                                        "kime": nearest_tracker,
+                                        "mesafe_cm": round(float(travel), 1),
+                                    }
+                            else:
+                                turnovers[last_holder_team] += 1
+                                pass_event = {
+                                    "olay": "top_kaybi",
+                                    "kaybeden_takim": last_holder_team,
+                                    "kazanan_takim": nearest_team,
+                                }
+                        last_holder_tracker_id = nearest_tracker
+                        last_holder_team = nearest_team
+                        last_holder_xy = pitch_players_xy[nearest_idx].copy()
+                    elif nearest_tracker == last_holder_tracker_id:
+                        last_holder_xy = pitch_players_xy[nearest_idx].copy()
+
+            # --- 8) Anlik istatistikler ----------------------------------------------
+            total_poss = possession_frames[0] + possession_frames[1]
+            poss_a = round(possession_frames[0] / total_poss * 100, 1) if total_poss else 0.0
+
+            # --- 9) Voronoi izgarasi (toggle icin, seyrek gonder) ----------------------
+            voronoi_payload = None
+            if frame_idx % VORONOI_STRIDE == 0:
+                vgrid = compute_voronoi_grid(
+                    pitch_players_xy[team_ids == 0], pitch_players_xy[team_ids == 1]
+                )
+                if vgrid is not None:
+                    voronoi_samples.append(float(np.mean(vgrid == 0) * 100.0))
+                    voronoi_payload = vgrid.tolist()
+
+            # --- 9.5) RENDER: islenmis kareyi MP4'e yaz (sadece render modunda) -----
+            if sink is not None:
+                annotated = frame.copy()
+                # Oyuncular: takim renginde elips + "#id" etiketi
+                annotated = ELLIPSE_ANNOTATOR.annotate(scene=annotated, detections=players)
+                id_labels = [
+                    f"#{int(t)}" if t is not None else "?"
+                    for t in (tracker_ids if tracker_ids is not None else [])
+                ]
+                if id_labels:
+                    annotated = LABEL_ANNOTATOR.annotate(
+                        scene=annotated, detections=players, labels=id_labels
+                    )
+                # Top: sari ucgen (en guvenilir tek tespit, kutusu genisletilmis)
+                if len(ball_detections) > 0:
+                    best_ball = ball_detections[[int(np.argmax(ball_detections.confidence))]]
+                    best_ball.xyxy = sv.pad_boxes(xyxy=best_ball.xyxy, px=10)
+                    annotated = TRIANGLE_ANNOTATOR.annotate(
+                        scene=annotated, detections=best_ball
+                    )
+                # Mini radar: kusbakisi saha, alt-ortaya yari saydam bindirilir
+                radar = draw_pitch(CONFIG)
+                for team, hexcol in ((0, "00BFFF"), (1, "FF1493")):
+                    pts = pitch_players_xy[team_ids == team]
+                    if len(pts) > 0:
+                        radar = draw_points_on_pitch(
+                            config=CONFIG, xy=pts,
+                            face_color=sv.Color.from_hex(hexcol),
+                            edge_color=sv.Color.BLACK, radius=16, pitch=radar,
+                        )
+                if pitch_ball_xy is not None:
+                    radar = draw_points_on_pitch(
+                        config=CONFIG, xy=np.array([pitch_ball_xy]),
+                        face_color=sv.Color.WHITE, edge_color=sv.Color.BLACK,
+                        radius=10, pitch=radar,
+                    )
+                fh, fw = annotated.shape[:2]
+                rw = int(fw * RADAR_INSET_RATIO)
+                rh = int(radar.shape[0] * rw / radar.shape[1])
+                radar_small = cv2.resize(radar, (rw, rh))
+                x0, y0 = (fw - rw) // 2, fh - rh - 12
+                roi = annotated[y0:y0 + rh, x0:x0 + rw]
+                annotated[y0:y0 + rh, x0:x0 + rw] = cv2.addWeighted(
+                    radar_small, 0.75, roi, 0.25, 0
+                )
+                sink.write_frame(annotated)
+
+            # --- 10) KARE MESAJI: WebSocket'in frontend'e firlatacagi paket ------------
+            yield {
+                "tip": "kare",
+                "kare": frame_idx,
+                "ilerleme_yuzde": round(frame_idx / processed_total * 100, 1),
+                "video_zamani_saniye": video_time_sec,
+                "oyuncular": [
+                    {
+                        "id": int(tid) if tid is not None else -1,
+                        "takim": int(team),
+                        "x": round(float(xy[0]), 1),
+                        "y": round(float(xy[1]), 1),
+                    }
+                    for xy, team, tid in zip(
+                        pitch_players_xy,
+                        team_ids,
+                        tracker_ids if tracker_ids is not None else [None] * len(team_ids),
+                    )
+                ],
+                "top": (
+                    {"x": round(float(pitch_ball_xy[0]), 1), "y": round(float(pitch_ball_xy[1]), 1)}
+                    if pitch_ball_xy is not None
+                    else None
+                ),
+                "topu_kontrol_eden": {
+                    "oyuncu_id": last_holder_tracker_id,
+                    "takim": last_holder_team,
+                },
+                "olay": pass_event,
+                "istatistik": {
+                    "takim_A": {"pas": passes[0], "top_kaybi": turnovers[0], "topa_sahip_olma_yuzde": poss_a},
+                    "takim_B": {"pas": passes[1], "top_kaybi": turnovers[1], "topa_sahip_olma_yuzde": round(100 - poss_a, 1) if total_poss else 0.0},
+                },
+                "voronoi_izgara": voronoi_payload,  # null degilse radarin uzerine bindir
+            }
+    finally:
+        # Render modunda MP4 dosyasini kapat/finalize et. Kullanici baglantiyi
+        # kapatsa bile (GeneratorExit) buraya dusulur, dosya bozuk kalmaz.
+        if sink is not None:
+            sink.__exit__(None, None, None)
 
     # =========================================================================
     # DONGU BITTI -> NIHAI OZET
@@ -454,14 +696,15 @@ def analyze_video_stream(video_path: str) -> Generator[dict, None, None]:
             },
         },
         "top_yorungesi": ball_path,
+        "islenmis_video": bool(render_path),
         "birimler": "Tum koordinatlar santimetre; saha 12000x7000 cm (SoccerPitchConfiguration)",
     }
 
 
-def process_video(video_path: str) -> dict:
+def process_video(video_path: str, render_path: Optional[str] = None) -> dict:
     """Tek atimlik kullanim: akisi sonuna kadar tuketir, sadece ozeti dondurur."""
     summary = None
-    for message in analyze_video_stream(video_path):
+    for message in analyze_video_stream(video_path, render_path=render_path):
         if message["tip"] == "ozet":
             summary = message
     if summary is None:
@@ -504,6 +747,15 @@ def serve_dashboard():
 # Not: Bu basit sozluk tek sunucu/tek islem icin yeterlidir. Coklu worker'a
 # gecersen (uvicorn --workers 2+) Redis gibi paylasimli bir depoya tasinmali.
 UPLOADS: Dict[str, str] = {}
+
+# Tamamlanmis islenmis (render) videolar: video_id -> mp4 yolu
+RENDERS: Dict[str, str] = {}
+
+# Islenmis videolar artik gecici klasore degil, script'in yanindaki kalici
+# "footballiq_ciktilar" klasorune yazilir. Boylece tarayici indirmese bile
+# dosya her zaman diskte hazir durur ve sunucu yeniden baslasa da kaybolmaz.
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "footballiq_ciktilar")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 ALLOWED_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
 
@@ -551,13 +803,31 @@ async def ws_analyze(websocket: WebSocket, video_id: str):
         await websocket.close()
         return
 
-    stream = analyze_video_stream(video_path)
+    # Render modu: frontend WS adresine ?render=1 eklerse, analizle birlikte
+    # cizimli (elips + etiket + sari ucgen + mini radar) bir MP4 de uretilir.
+    # Dosya, script'in yanindaki footballiq_ciktilar klasorune kalici yazilir.
+    render_on = websocket.query_params.get("render") == "1"
+    render_path = (
+        os.path.join(
+            OUTPUT_DIR,
+            f"analiz_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{video_id[:8]}.mp4",
+        )
+        if render_on
+        else None
+    )
+
+    stream = analyze_video_stream(video_path, render_path=render_path)
     try:
         while True:
             # Senkron generator'un bir adimini thread'de calistir:
             message = await asyncio.to_thread(next, stream, None)
             if message is None:
                 break  # Akis bitti
+            if message["tip"] == "ozet" and render_on:
+                # MP4 hazir: indirilebilir adresi kaydet ve ozete ekle
+                RENDERS[video_id] = render_path
+                message["islenmis_video_url"] = f"/render/{video_id}"
+                message["islenmis_video_dosya"] = render_path  # diskteki kalici yol
             await websocket.send_json(message)
         await websocket.close()
     except WebSocketDisconnect:
@@ -580,6 +850,15 @@ async def ws_analyze(websocket: WebSocket, video_id: str):
         UPLOADS.pop(video_id, None)
         if os.path.exists(video_path):
             os.remove(video_path)
+
+
+@app.get("/render/{video_id}")
+def get_rendered_video(video_id: str):
+    """Islenmis (cizimli) MP4'u dondurur; tarayicida oynatilabilir veya indirilebilir."""
+    path = RENDERS.get(video_id)
+    if path is None or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Islenmis video bulunamadi veya henuz hazir degil.")
+    return FileResponse(path, media_type="video/mp4", filename="footballiq_analiz.mp4")
 
 
 @app.post("/analyze")

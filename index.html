@@ -73,6 +73,11 @@
     border-radius: var(--radius); padding: 9px 20px;
   }
   .upload-btn:disabled { opacity: .45; cursor: not-allowed; }
+  .render-opt {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--text-dim); cursor: pointer;
+    border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px;
+  }
 
   /* ---------- Ana yerlesim: sol (video+istatistik) / sag (radar) ---------- */
   .layout {
@@ -217,6 +222,7 @@
   <div class="wordmark">Football<span>IQ</span></div>
   <div class="conn" id="conn"><span class="dot"></span><span id="connText">Baglanti bekleniyor</span></div>
   <div class="spacer"></div>
+  <label class="render-opt"><input type="checkbox" id="renderToggle"> MP4 çıktısı üret</label>
   <input type="file" id="fileInput" accept=".mp4,.avi,.mov,.mkv" hidden>
   <button class="upload-btn" id="uploadBtn">Video yukle ve analiz et</button>
 </header>
@@ -377,13 +383,21 @@ $("fileInput").addEventListener("change", async (e) => {
 
 function openSocket(videoId) {
   const wsBase = API_BASE.replace(/^http/, "ws");
-  ws = new WebSocket(`${wsBase}/ws/analyze/${videoId}`);
+  const renderQ = $("renderToggle").checked ? "?render=1" : "";
+  ws = new WebSocket(`${wsBase}/ws/analyze/${videoId}${renderQ}`);
 
   ws.onopen = () => setConn("live", "Canli analiz akisi acik");
   ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
-  ws.onerror = () => setConn("error", "Baglanti hatasi — backend calisiyor mu?");
-  ws.onclose = () => {
-    if ($("conn").classList.contains("live")) setConn("idle", "Akis kapandi");
+  ws.onerror = () => setConn("error", "WebSocket kurulamadi");
+  ws.onclose = (e) => {
+    // 1006 = el sikisma reddedildi/koptu. En sik sebep: sunucuda WebSocket
+    // destegi eksik -> pip install "uvicorn[standard]" websockets
+    if (!e.wasClean && e.code === 1006) {
+      setConn("error", "WS reddedildi (kod 1006) — sunucuda: pip install \"uvicorn[standard]\" websockets");
+      $("statusText").textContent = "Sunucu terminalindeki hata izine bak";
+    } else if ($("conn").classList.contains("live")) {
+      setConn("idle", "Akis kapandi");
+    }
     $("uploadBtn").disabled = false;
   };
 }
@@ -397,7 +411,8 @@ function handleMessage(msg) {
     return;
   }
   if (msg.tip === "hata") {
-    setConn("error", msg.mesaj);
+    setConn("error", "Analiz hatasi");
+    $("statusText").textContent = msg.mesaj;  // Python hatasinin ozeti burada gorunur
     return;
   }
   if (msg.tip === "ozet") {
@@ -492,6 +507,29 @@ function showSummary(oz) {
     <span class="chip">A alan kontrolu <b>${A.alan_kontrolu_yuzde ?? "--"}%</b></span>
     <span class="chip">B alan kontrolu <b>${B.alan_kontrolu_yuzde ?? "--"}%</b></span>
     <span class="chip">Video <b>${oz.video_bilgisi.sure_saniye}s</b> · ${oz.video_bilgisi.fps} fps</span>`;
+  if (oz.islenmis_video_url) {
+    const url = API_BASE + oz.islenmis_video_url;
+    chips.innerHTML += `
+      <a class="chip" href="${url}" download style="text-decoration:none">İşlenmiş videoyu indir <b>MP4</b></a>
+      <button class="chip" id="playRendered" style="cursor:pointer">Oynatıcıda izle</button>
+      <span class="chip">İndirilenler klasörüne otomatik kaydedildi · sunucuda: <b>footballiq_ciktilar</b></span>`;
+    // OTOMATIK INDIRME: ozet gelir gelmez MP4'u tarayicinin Indirilenler
+    // klasorune kaydet (kullanici tiklamasina gerek kalmadan).
+    const autoLink = document.createElement("a");
+    autoLink.href = url;
+    autoLink.download = "footballiq_analiz.mp4";
+    document.body.appendChild(autoLink);
+    autoLink.click();
+    autoLink.remove();
+    setTimeout(() => {
+      const btn = $("playRendered");
+      if (btn) btn.addEventListener("click", () => {
+        const v = $("video");
+        $("syncToggle").checked = false; // islenmis video kendi hizinda oynar
+        v.src = url; v.load(); v.play();
+      });
+    }, 0);
+  }
   $("summary").classList.add("show");
 }
 

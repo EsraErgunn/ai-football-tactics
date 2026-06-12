@@ -1,0 +1,10 @@
+# Sanal ortamı gizle
+.venv/
+__pycache__/
+*.pyc
+
+# Büyük video dosyalarını ve geçici dosyaları gizle
+*.mp4
+*.avi
+*.mov
+*.mkv

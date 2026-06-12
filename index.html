@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FootballIQ — Canlı Taktik Analiz</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* ==========================================================================
+     FootballIQ tasarim sistemi
+     Koyu "yayin studyosu" temasi: cim yesili tonlu komur zemin,
+     takim renkleri kaynaktaki gibi mavi (#00BFFF) ve pembe (#FF1493),
+     top vurgusu parlak sari (#FFD700).
+     ========================================================================== */
+  :root {
+    --bg:        #101714;   /* cim tonlu komur */
+    --panel:     #18211d;
+    --panel-2:   #1e2a24;
+    --line:      #2c3a33;
+    --text:      #e8efe9;
+    --text-dim:  #93a39a;
+    --team-a:    #00BFFF;   /* Takim A - mavi  */
+    --team-b:    #FF1493;   /* Takim B - pembe */
+    --ball:      #FFD700;   /* Top - sari      */
+    --pitch:     #1b3326;   /* radar saha zemini */
+    --pitch-line:#4d6f5c;
+    --ok:        #57d98c;
+    --err:       #ff6b6b;
+    --radius:    10px;
+    --font-disp: "Barlow Condensed", "Arial Narrow", sans-serif;
+    --font-body: "Inter", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 70% -10%, rgba(0,191,255,.06), transparent 60%),
+      radial-gradient(1000px 500px at 10% 110%, rgba(255,20,147,.05), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 14px;
+    padding: 16px;
+  }
+  button { font-family: inherit; cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--ball); outline-offset: 2px; }
+
+  /* ---------- Ust bar ---------- */
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 4px 4px 14px;
+  }
+  .wordmark {
+    font-family: var(--font-disp);
+    font-weight: 700; font-size: 26px; letter-spacing: .5px;
+    text-transform: uppercase;
+  }
+  .wordmark span { color: var(--ball); }
+  .conn {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12px; color: var(--text-dim);
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px;
+  }
+  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); }
+  .conn.live .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .conn.error .dot { background: var(--err); }
+  header .spacer { flex: 1; }
+  .upload-btn {
+    font-family: var(--font-disp); font-weight: 600; font-size: 16px;
+    letter-spacing: .5px; text-transform: uppercase;
+    background: var(--ball); color: #1a1500; border: none;
+    border-radius: var(--radius); padding: 9px 20px;
+  }
+  .upload-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* ---------- Ana yerlesim: sol (video+istatistik) / sag (radar) ---------- */
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(340px, 5fr) minmax(420px, 7fr);
+    gap: 16px;
+    align-items: start;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .panel h2 {
+    font-family: var(--font-disp); font-weight: 600; font-size: 15px;
+    letter-spacing: 1.2px; text-transform: uppercase; color: var(--text-dim);
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .left-col { display: flex; flex-direction: column; gap: 16px; }
+
+  /* ---------- Video ---------- */
+  .video-wrap { position: relative; background: #000; aspect-ratio: 16/9; }
+  .video-wrap video { width: 100%; height: 100%; display: block; }
+  .video-empty {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 8px;
+    color: var(--text-dim); font-size: 13px; text-align: center; padding: 20px;
+  }
+  .sync-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 14px; font-size: 12px; color: var(--text-dim);
+    border-top: 1px solid var(--line);
+  }
+
+  /* ---------- Istatistik paneli ---------- */
+  .stats-body { padding: 14px; display: flex; flex-direction: column; gap: 14px; }
+
+  .poss-labels {
+    display: flex; justify-content: space-between;
+    font-family: var(--font-disp); font-size: 22px; font-weight: 700;
+  }
+  .poss-labels .a { color: var(--team-a); }
+  .poss-labels .b { color: var(--team-b); }
+  .poss-labels small {
+    display: block; font-family: var(--font-body); font-weight: 500;
+    font-size: 10px; letter-spacing: 1px; color: var(--text-dim);
+  }
+  .poss-bar {
+    height: 14px; border-radius: 999px; overflow: hidden;
+    display: flex; background: var(--panel-2);
+  }
+  .poss-bar .fill-a { background: var(--team-a); transition: width .6s ease; }
+  .poss-bar .fill-b { background: var(--team-b); transition: width .6s ease; flex: 1; }
+
+  .stat-grid {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; text-align: center;
+  }
+  .stat-cell {
+    background: var(--panel-2); border-radius: 8px; padding: 8px 4px;
+  }
+  .stat-cell .num {
+    font-family: var(--font-disp); font-size: 24px; font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat-cell .num.a { color: var(--team-a); }
+  .stat-cell .num.b { color: var(--team-b); }
+  .stat-cell .lbl { font-size: 10px; letter-spacing: 1px; color: var(--text-dim); text-transform: uppercase; }
+  .stat-cell.mid { display: flex; flex-direction: column; justify-content: center; }
+
+  .progress-row { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-dim); }
+  .progress-track { flex: 1; height: 5px; border-radius: 999px; background: var(--panel-2); overflow: hidden; }
+  .progress-fill { height: 100%; width: 0%; background: var(--ok); transition: width .4s ease; }
+
+  /* ---------- Olay seridi (broadcast alt yazi hissi) ---------- */
+  .ticker { display: flex; flex-direction: column; gap: 6px; max-height: 150px; overflow-y: auto; }
+  .ticker:empty::after {
+    content: "Henuz olay yok — analiz basladiginda paslar burada akacak.";
+    color: var(--text-dim); font-size: 12px;
+  }
+  .evt {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 12.5px; padding: 7px 10px;
+    background: var(--panel-2); border-radius: 7px;
+    border-left: 3px solid var(--text-dim);
+    animation: slideIn .35s ease;
+  }
+  .evt.a { border-left-color: var(--team-a); }
+  .evt.b { border-left-color: var(--team-b); }
+  .evt .t {
+    font-family: var(--font-disp); font-weight: 600; color: var(--text-dim);
+    font-variant-numeric: tabular-nums; min-width: 44px;
+  }
+  @keyframes slideIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    .evt { animation: none; }
+    .poss-bar .fill-a, .poss-bar .fill-b, .progress-fill { transition: none; }
+  }
+
+  /* ---------- Radar ---------- */
+  .radar-head-controls { margin-left: auto; display: flex; gap: 6px; }
+  .toggle {
+    font-size: 11px; letter-spacing: .6px; text-transform: uppercase;
+    background: var(--panel-2); color: var(--text-dim);
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px;
+  }
+  .toggle[aria-pressed="true"] { background: var(--ball); border-color: var(--ball); color: #1a1500; font-weight: 600; }
+  .radar-body { padding: 12px; }
+  #radar { width: 100%; height: auto; display: block; border-radius: 8px; background: var(--pitch); }
+  .legend {
+    display: flex; gap: 18px; justify-content: center;
+    padding: 10px 0 2px; font-size: 11.5px; color: var(--text-dim);
+  }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+  .legend .la i { background: var(--team-a); }
+  .legend .lb i { background: var(--team-b); }
+  .legend .lt i { background: var(--ball); border-radius: 2px; transform: rotate(45deg); }
+
+  /* ---------- Ozet kartlari ---------- */
+  .summary { display: none; padding: 0 14px 14px; }
+  .summary.show { display: block; }
+  .summary h3 {
+    font-family: var(--font-disp); font-size: 14px; letter-spacing: 1px;
+    text-transform: uppercase; color: var(--ok); margin-bottom: 8px;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-size: 12px; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 999px; padding: 5px 12px; color: var(--text-dim);
+  }
+  .chip b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  @media (max-width: 920px) {
+    .layout { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wordmark">Football<span>IQ</span></div>
+  <div class="conn" id="conn"><span class="dot"></span><span id="connText">Baglanti bekleniyor</span></div>
+  <div class="spacer"></div>
+  <input type="file" id="fileInput" accept=".mp4,.avi,.mov,.mkv" hidden>
+  <button class="upload-btn" id="uploadBtn">Video yukle ve analiz et</button>
+</header>
+
+<div class="layout">
+
+  <!-- ============ SOL SUTUN: video (ust) + istatistik (alt) ============ -->
+  <div class="left-col">
+
+    <section class="panel">
+      <h2>Mac videosu</h2>
+      <div class="video-wrap">
+        <video id="video" muted playsinline></video>
+        <div class="video-empty" id="videoEmpty">
+          <strong>Video secilmedi</strong>
+          <span>Sag ustteki butondan bir mac videosu yukle.<br>Analiz baslayinca radar ve istatistikler canli akar.</span>
+        </div>
+      </div>
+      <label class="sync-row">
+        <input type="checkbox" id="syncToggle" checked>
+        Videoyu analiz zamaniyla senkronla (analiz yavas oldugu icin video kare kare ilerler)
+      </label>
+    </section>
+
+    <section class="panel">
+      <h2>Canli istatistikler</h2>
+      <div class="stats-body">
+
+        <div>
+          <div class="poss-labels">
+            <div class="a"><span id="possA">--</span>%<small>TAKIM A · TOPA SAHIP OLMA</small></div>
+            <div class="b" style="text-align:right"><span id="possB">--</span>%<small>TOPA SAHIP OLMA · TAKIM B</small></div>
+          </div>
+          <div class="poss-bar"><div class="fill-a" id="possBarA" style="width:50%"></div><div class="fill-b"></div></div>
+        </div>
+
+        <div class="stat-grid">
+          <div class="stat-cell"><div class="num a" id="passA">0</div><div class="lbl">Pas</div></div>
+          <div class="stat-cell mid"><div class="lbl">Basarili pas</div></div>
+          <div class="stat-cell"><div class="num b" id="passB">0</div><div class="lbl">Pas</div></div>
+          <div class="stat-cell"><div class="num a" id="toA">0</div><div class="lbl">Top kaybi</div></div>
+          <div class="stat-cell mid"><div class="lbl">Top kaybi</div></div>
+          <div class="stat-cell"><div class="num b" id="toB">0</div><div class="lbl">Top kaybi</div></div>
+        </div>
+
+        <div class="progress-row">
+          <span id="statusText">Hazir</span>
+          <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+          <span id="progressPct">0%</span>
+        </div>
+
+        <div class="ticker" id="ticker"></div>
+      </div>
+
+      <div class="summary" id="summary">
+        <h3>Analiz tamamlandi</h3>
+        <div class="chips" id="summaryChips"></div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ============ SAG SUTUN: 2D radar ============ -->
+  <section class="panel">
+    <h2>
+      Canli 2D radar
+      <span class="radar-head-controls">
+        <button class="toggle" id="tglVoronoi" aria-pressed="false">Voronoi</button>
+        <button class="toggle" id="tglHeat" aria-pressed="false">Isi haritasi</button>
+        <button class="toggle" id="tglTrail" aria-pressed="false">Top yorungesi</button>
+      </span>
+    </h2>
+    <div class="radar-body">
+      <canvas id="radar" width="1000" height="640"></canvas>
+      <div class="legend">
+        <span class="la"><i></i>Takim A</span>
+        <span class="lb"><i></i>Takim B</span>
+        <span class="lt"><i></i>Top</span>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+/* ============================================================================
+   AYARLAR
+   ========================================================================== */
+// Backend adresi. index.html'i FastAPI uzerinden /app adresinde acarsan
+// otomatik ayni sunucuyu kullanir; dosyayi cift tiklayip actiysan localhost'a duser.
+const API_BASE = location.origin.startsWith("http") ? location.origin : "http://localhost:8000";
+
+// Saha olculeri (backend ile ayni: SoccerPitchConfiguration, cm)
+const PITCH_L = 12000, PITCH_W = 7000;
+
+// Renkler (CSS degiskenleriyle birebir ayni)
+const COL = {
+  a: "#00BFFF", b: "#FF1493", ball: "#FFD700",
+  line: "#4d6f5c", text: "#e8efe9"
+};
+
+// Lerp hizi: her animasyon karesinde hedefe bu oranda yaklas.
+// prefers-reduced-motion acik ise animasyonsuz, dogrudan isinlanma.
+const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const LERP_K = REDUCED ? 1 : 0.10;
+
+const VORONOI_COLS = 60, VORONOI_ROWS = 40;
+const HEAT_COLS = 60, HEAT_ROWS = 40;
+
+/* ============================================================================
+   DURUM (state)
+   ========================================================================== */
+const players = new Map();   // id -> {x,y,tx,ty,team,lastSeen}
+let ballPos = null;          // {x,y,tx,ty}
+let ballTrail = [];          // [[x,y], ...] son ~300 nokta
+let voronoiGrid = null;      // 40x60 (0/1) - backend'den gelen son izgara
+const heatGrid = {
+  0: new Float32Array(HEAT_COLS * HEAT_ROWS),
+  1: new Float32Array(HEAT_COLS * HEAT_ROWS),
+};
+let heatMax = 1;
+let ws = null;
+
+const $ = (id) => document.getElementById(id);
+const toggles = { voronoi: false, heat: false, trail: false };
+
+/* ============================================================================
+   YUKLEME AKISI: POST /upload -> video_id -> WebSocket
+   ========================================================================== */
+$("uploadBtn").addEventListener("click", () => $("fileInput").click());
+
+$("fileInput").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  // Orijinal videoyu sol ust oynaticiya bagla (yerel dosyadan, sunucuya gerek yok)
+  const video = $("video");
+  video.src = URL.createObjectURL(file);
+  video.load();
+  $("videoEmpty").style.display = "none";
+
+  resetState();
+  setConn("connecting", "Video sunucuya yukleniyor...");
+  $("uploadBtn").disabled = true;
+
+  try {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: form });
+    if (!res.ok) throw new Error(`Yukleme basarisiz (HTTP ${res.status})`);
+    const { video_id } = await res.json();
+    openSocket(video_id);
+  } catch (err) {
+    setConn("error", err.message);
+    $("uploadBtn").disabled = false;
+  }
+});
+
+function openSocket(videoId) {
+  const wsBase = API_BASE.replace(/^http/, "ws");
+  ws = new WebSocket(`${wsBase}/ws/analyze/${videoId}`);
+
+  ws.onopen = () => setConn("live", "Canli analiz akisi acik");
+  ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+  ws.onerror = () => setConn("error", "Baglanti hatasi — backend calisiyor mu?");
+  ws.onclose = () => {
+    if ($("conn").classList.contains("live")) setConn("idle", "Akis kapandi");
+    $("uploadBtn").disabled = false;
+  };
+}
+
+/* ============================================================================
+   GELEN MESAJLARI ISLE (durum / kare / ozet / hata)
+   ========================================================================== */
+function handleMessage(msg) {
+  if (msg.tip === "durum") {
+    $("statusText").textContent = msg.mesaj;
+    return;
+  }
+  if (msg.tip === "hata") {
+    setConn("error", msg.mesaj);
+    return;
+  }
+  if (msg.tip === "ozet") {
+    showSummary(msg);
+    setConn("idle", "Analiz tamamlandi");
+    return;
+  }
+  if (msg.tip !== "kare") return;
+
+  // --- Ilerleme + durum ---
+  $("statusText").textContent = "Analiz akiyor";
+  $("progressFill").style.width = msg.ilerleme_yuzde + "%";
+  $("progressPct").textContent = msg.ilerleme_yuzde + "%";
+
+  // --- Video senkronu: oynatici, analiz edilen ana atlar ---
+  if ($("syncToggle").checked) {
+    const v = $("video");
+    if (v.readyState >= 1) { v.pause(); v.currentTime = msg.video_zamani_saniye; }
+  }
+
+  // --- Oyuncular: hedef konumlari guncelle (Lerp rAF dongusunde isler) ---
+  const now = performance.now();
+  for (const p of msg.oyuncular) {
+    const ex = players.get(p.id);
+    if (ex) {
+      ex.tx = p.x; ex.ty = p.y; ex.team = p.takim; ex.lastSeen = now;
+    } else {
+      players.set(p.id, { x: p.x, y: p.y, tx: p.x, ty: p.y, team: p.takim, lastSeen: now });
+    }
+    // Isi haritasini istemci tarafinda biriktir
+    const cx = Math.min(HEAT_COLS - 1, Math.max(0, Math.floor(p.x / PITCH_L * HEAT_COLS)));
+    const cy = Math.min(HEAT_ROWS - 1, Math.max(0, Math.floor(p.y / PITCH_W * HEAT_ROWS)));
+    const g = heatGrid[p.takim];
+    g[cy * HEAT_COLS + cx] += 1;
+    if (g[cy * HEAT_COLS + cx] > heatMax) heatMax = g[cy * HEAT_COLS + cx];
+  }
+  // 4 saniyedir gorunmeyen oyunculari radardan dusur (oyundan cikti / takip koptu)
+  for (const [id, p] of players) if (now - p.lastSeen > 4000) players.delete(id);
+
+  // --- Top ---
+  if (msg.top) {
+    if (ballPos) { ballPos.tx = msg.top.x; ballPos.ty = msg.top.y; }
+    else ballPos = { x: msg.top.x, y: msg.top.y, tx: msg.top.x, ty: msg.top.y };
+    ballTrail.push([msg.top.x, msg.top.y]);
+    if (ballTrail.length > 300) ballTrail.shift();
+  }
+
+  // --- Voronoi izgarasi (seyrek gelir; geleni sakla) ---
+  if (msg.voronoi_izgara) voronoiGrid = msg.voronoi_izgara;
+
+  // --- Istatistikler ---
+  const A = msg.istatistik.takim_A, B = msg.istatistik.takim_B;
+  $("possA").textContent = A.topa_sahip_olma_yuzde;
+  $("possB").textContent = B.topa_sahip_olma_yuzde;
+  $("possBarA").style.width = A.topa_sahip_olma_yuzde + "%";
+  $("passA").textContent = A.pas;  $("passB").textContent = B.pas;
+  $("toA").textContent = A.top_kaybi; $("toB").textContent = B.top_kaybi;
+
+  // --- Olay seridi ---
+  if (msg.olay) addEvent(msg.olay, msg.video_zamani_saniye);
+}
+
+function addEvent(olay, t) {
+  const ticker = $("ticker");
+  const div = document.createElement("div");
+  const mm = String(Math.floor(t / 60)).padStart(2, "0");
+  const ss = String(Math.floor(t % 60)).padStart(2, "0");
+  let cls = "", text = "";
+  if (olay.olay === "pas") {
+    cls = olay.takim === 0 ? "a" : "b";
+    text = `Pas · #${olay.kimden} → #${olay.kime} (${(olay.mesafe_cm / 100).toFixed(1)} m)`;
+  } else {
+    cls = olay.kaybeden_takim === 0 ? "a" : "b";
+    const k = olay.kaybeden_takim === 0 ? "A" : "B";
+    const z = olay.kazanan_takim === 0 ? "A" : "B";
+    text = `Top kaybi · Takim ${k} → Takim ${z}`;
+  }
+  div.className = `evt ${cls}`;
+  div.innerHTML = `<span class="t">${mm}:${ss}</span><span>${text}</span>`;
+  ticker.prepend(div);
+  while (ticker.children.length > 12) ticker.lastChild.remove();
+}
+
+function showSummary(oz) {
+  const chips = $("summaryChips");
+  const A = oz.takim_A, B = oz.takim_B;
+  chips.innerHTML = `
+    <span class="chip">A pas <b>${A.pas}</b></span>
+    <span class="chip">B pas <b>${B.pas}</b></span>
+    <span class="chip">A possession <b>${A.topa_sahip_olma_yuzde}%</b> (${A.topa_sahip_olma_saniye}s)</span>
+    <span class="chip">B possession <b>${B.topa_sahip_olma_yuzde}%</b> (${B.topa_sahip_olma_saniye}s)</span>
+    <span class="chip">A alan kontrolu <b>${A.alan_kontrolu_yuzde ?? "--"}%</b></span>
+    <span class="chip">B alan kontrolu <b>${B.alan_kontrolu_yuzde ?? "--"}%</b></span>
+    <span class="chip">Video <b>${oz.video_bilgisi.sure_saniye}s</b> · ${oz.video_bilgisi.fps} fps</span>`;
+  $("summary").classList.add("show");
+}
+
+/* ============================================================================
+   RADAR CIZIMI (HTML5 Canvas + Lerp animasyon dongusu)
+   ========================================================================== */
+const canvas = $("radar");
+const ctx = canvas.getContext("2d");
+const PAD = 30; // canvas ici kenar boslugu (px)
+
+// cm -> canvas px donusumu
+function sx(x) { return PAD + x / PITCH_L * (canvas.width - 2 * PAD); }
+function sy(y) { return PAD + y / PITCH_W * (canvas.height - 2 * PAD); }
+
+function drawPitch() {
+  const L = ctx;
+  L.strokeStyle = COL.line;
+  L.lineWidth = 2;
+
+  const x0 = sx(0), y0 = sy(0), x1 = sx(PITCH_L), y1 = sy(PITCH_W);
+  L.strokeRect(x0, y0, x1 - x0, y1 - y0);                 // dis cizgiler
+  L.beginPath(); L.moveTo(sx(6000), y0); L.lineTo(sx(6000), y1); L.stroke(); // orta cizgi
+  L.beginPath(); L.arc(sx(6000), sy(3500), (sx(915) - sx(0)), 0, Math.PI * 2); L.stroke(); // orta yuvarlak
+
+  // Ceza sahalari (16.5m derinlik, 40.32m genislik) + kale alanlari (5.5m, 18.32m)
+  for (const side of [0, 1]) {
+    const dir = side === 0 ? 1 : -1;
+    const gx = side === 0 ? 0 : PITCH_L;
+    L.strokeRect(sx(gx), sy(3500 - 2016), (sx(gx + dir * 1650) - sx(gx)), sy(3500 + 2016) - sy(3500 - 2016));
+    L.strokeRect(sx(gx), sy(3500 - 916),  (sx(gx + dir * 550)  - sx(gx)), sy(3500 + 916)  - sy(3500 - 916));
+    // penalti noktasi
+    L.beginPath(); L.arc(sx(gx + dir * 1100), sy(3500), 3, 0, Math.PI * 2);
+    L.fillStyle = COL.line; L.fill();
+  }
+  // orta nokta
+  ctx.beginPath(); ctx.arc(sx(6000), sy(3500), 3, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawVoronoi() {
+  if (!voronoiGrid) return;
+  const cw = (canvas.width - 2 * PAD) / VORONOI_COLS;
+  const ch = (canvas.height - 2 * PAD) / VORONOI_ROWS;
+  ctx.globalAlpha = 0.22;
+  for (let r = 0; r < VORONOI_ROWS; r++) {
+    for (let c = 0; c < VORONOI_COLS; c++) {
+      ctx.fillStyle = voronoiGrid[r][c] === 0 ? COL.a : COL.b;
+      ctx.fillRect(PAD + c * cw, PAD + r * ch, cw + .5, ch + .5);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHeat() {
+  const cw = (canvas.width - 2 * PAD) / HEAT_COLS;
+  const ch = (canvas.height - 2 * PAD) / HEAT_ROWS;
+  for (const team of [0, 1]) {
+    const g = heatGrid[team];
+    ctx.fillStyle = team === 0 ? COL.a : COL.b;
+    for (let r = 0; r < HEAT_ROWS; r++) {
+      for (let c = 0; c < HEAT_COLS; c++) {
+        const v = g[r * HEAT_COLS + c];
+        if (!v) continue;
+        ctx.globalAlpha = Math.min(0.55, (v / heatMax) * 0.55);
+        ctx.fillRect(PAD + c * cw, PAD + r * ch, cw + .5, ch + .5);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawTrail() {
+  if (ballTrail.length < 2) return;
+  ctx.strokeStyle = COL.ball;
+  ctx.lineWidth = 1.6;
+  ctx.globalAlpha = 0.7;
+  ctx.beginPath();
+  ctx.moveTo(sx(ballTrail[0][0]), sy(ballTrail[0][1]));
+  for (let i = 1; i < ballTrail.length; i++) ctx.lineTo(sx(ballTrail[i][0]), sy(ballTrail[i][1]));
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawPlayers() {
+  ctx.font = "600 11px Inter, sans-serif";
+  ctx.textAlign = "center";
+  for (const [id, p] of players) {
+    // Lerp: konumu hedefe yumusakca kaydir (isinlanma hissini onler)
+    p.x += (p.tx - p.x) * LERP_K;
+    p.y += (p.ty - p.y) * LERP_K;
+    const X = sx(p.x), Y = sy(p.y);
+    ctx.beginPath();
+    ctx.arc(X, Y, 9, 0, Math.PI * 2);
+    ctx.fillStyle = p.team === 0 ? COL.a : COL.b;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,.5)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // Tracker ID etiketi: "#5"
+    ctx.fillStyle = "#0b0f0d";
+    ctx.fillText("#" + id, X, Y + 3.5);
+  }
+}
+
+function drawBall() {
+  if (!ballPos) return;
+  ballPos.x += (ballPos.tx - ballPos.x) * LERP_K;
+  ballPos.y += (ballPos.ty - ballPos.y) * LERP_K;
+  const X = sx(ballPos.x), Y = sy(ballPos.y);
+  // Kaynaktaki gibi: top, sari UCGEN ile vurgulanir
+  ctx.beginPath();
+  ctx.moveTo(X, Y - 9);
+  ctx.lineTo(X - 7.5, Y + 5);
+  ctx.lineTo(X + 7.5, Y + 5);
+  ctx.closePath();
+  ctx.fillStyle = COL.ball;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,.55)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
+function frame() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (toggles.voronoi) drawVoronoi();
+  if (toggles.heat) drawHeat();
+  drawPitch();
+  if (toggles.trail) drawTrail();
+  drawPlayers();
+  drawBall();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ============================================================================
+   TOGGLE BUTONLARI + YARDIMCILAR
+   ========================================================================== */
+function bindToggle(btnId, key) {
+  $(btnId).addEventListener("click", () => {
+    toggles[key] = !toggles[key];
+    $(btnId).setAttribute("aria-pressed", String(toggles[key]));
+  });
+}
+bindToggle("tglVoronoi", "voronoi");
+bindToggle("tglHeat", "heat");
+bindToggle("tglTrail", "trail");
+
+function setConn(state, text) {
+  const el = $("conn");
+  el.classList.remove("live", "error");
+  if (state === "live") el.classList.add("live");
+  if (state === "error") el.classList.add("error");
+  $("connText").textContent = text;
+}
+
+function resetState() {
+  players.clear();
+  ballPos = null;
+  ballTrail = [];
+  voronoiGrid = null;
+  heatGrid[0].fill(0); heatGrid[1].fill(0); heatMax = 1;
+  $("ticker").innerHTML = "";
+  $("summary").classList.remove("show");
+  $("progressFill").style.width = "0%";
+  $("progressPct").textContent = "0%";
+  ["possA","possB"].forEach(id => $(id).textContent = "--");
+  ["passA","passB","toA","toB"].forEach(id => $(id).textContent = "0");
+  if (ws) { try { ws.close(); } catch {} ws = null; }
+}
+</script>
+</body>
+</html>

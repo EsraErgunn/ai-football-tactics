@@ -335,7 +335,9 @@ const HEAT_COLS = 60, HEAT_ROWS = 40;
 /* ============================================================================
    DURUM (state)
    ========================================================================== */
-const players = new Map();   // id -> {x,y,tx,ty,team,lastSeen}
+const players = new Map();   // id -> {x,y,tx,ty,team,lastKare}
+let currentKare = 0;         // son gelen islenen kare numarasi (silme/soluklasma icin)
+const PURGE_AFTER_FRAMES = 10; // oyuncu bu kadar islenen karede gorunmezse silinir
 let ballPos = null;          // {x,y,tx,ty}
 let ballTrail = [];          // [[x,y], ...] son ~300 nokta
 let voronoiGrid = null;      // 40x60 (0/1) - backend'den gelen son izgara
@@ -434,13 +436,16 @@ function handleMessage(msg) {
   }
 
   // --- Oyuncular: hedef konumlari guncelle (Lerp rAF dongusunde isler) ---
-  const now = performance.now();
+  // Silme karari DUVAR SAATINE gore DEGIL, islenen kare sayisina gore verilir:
+  // CPU'da kareler 1-2 sn arayla geldigi icin sure bazli silme, 2-3 karelik
+  // dogal tespit bosluklarinda oyunculari yanlislikla ucuruyordu.
+  currentKare = msg.kare;
   for (const p of msg.oyuncular) {
     const ex = players.get(p.id);
     if (ex) {
-      ex.tx = p.x; ex.ty = p.y; ex.team = p.takim; ex.lastSeen = now;
+      ex.tx = p.x; ex.ty = p.y; ex.team = p.takim; ex.lastKare = msg.kare;
     } else {
-      players.set(p.id, { x: p.x, y: p.y, tx: p.x, ty: p.y, team: p.takim, lastSeen: now });
+      players.set(p.id, { x: p.x, y: p.y, tx: p.x, ty: p.y, team: p.takim, lastKare: msg.kare });
     }
     // Isi haritasini istemci tarafinda biriktir
     const cx = Math.min(HEAT_COLS - 1, Math.max(0, Math.floor(p.x / PITCH_L * HEAT_COLS)));
@@ -449,8 +454,9 @@ function handleMessage(msg) {
     g[cy * HEAT_COLS + cx] += 1;
     if (g[cy * HEAT_COLS + cx] > heatMax) heatMax = g[cy * HEAT_COLS + cx];
   }
-  // 4 saniyedir gorunmeyen oyunculari radardan dusur (oyundan cikti / takip koptu)
-  for (const [id, p] of players) if (now - p.lastSeen > 4000) players.delete(id);
+  // PURGE_AFTER_FRAMES islenen karedir gorunmeyen oyunculari dusur
+  for (const [id, p] of players)
+    if (currentKare - p.lastKare > PURGE_AFTER_FRAMES) players.delete(id);
 
   // --- Top ---
   if (msg.top) {
@@ -509,24 +515,29 @@ function showSummary(oz) {
     <span class="chip">Video <b>${oz.video_bilgisi.sure_saniye}s</b> · ${oz.video_bilgisi.fps} fps</span>`;
   if (oz.islenmis_video_url) {
     const url = API_BASE + oz.islenmis_video_url;
+    const diskYol = oz.islenmis_video_dosya || "footballiq_ciktilar klasoru";
     chips.innerHTML += `
-      <a class="chip" href="${url}" download style="text-decoration:none">İşlenmiş videoyu indir <b>MP4</b></a>
-      <button class="chip" id="playRendered" style="cursor:pointer">Oynatıcıda izle</button>
-      <span class="chip">İndirilenler klasörüne otomatik kaydedildi · sunucuda: <b>footballiq_ciktilar</b></span>`;
-    // OTOMATIK INDIRME: ozet gelir gelmez MP4'u tarayicinin Indirilenler
-    // klasorune kaydet (kullanici tiklamasina gerek kalmadan).
-    const autoLink = document.createElement("a");
-    autoLink.href = url;
-    autoLink.download = "footballiq_analiz.mp4";
-    document.body.appendChild(autoLink);
-    autoLink.click();
-    autoLink.remove();
+      <a class="chip" href="${url}" download="footballiq_analiz.mp4" style="text-decoration:none;cursor:pointer">⬇ İndir <b>MP4</b></a>
+      <button class="chip" id="playRendered" style="cursor:pointer">▶ Oynatıcıda izle</button>
+      <button class="chip" id="openFolder" style="cursor:pointer">📁 Klasörü aç</button>
+      <span class="chip" id="diskPath" title="${diskYol}" style="cursor:pointer">Diske kaydedildi: <b>${shortenPath(diskYol)}</b></span>`;
     setTimeout(() => {
-      const btn = $("playRendered");
-      if (btn) btn.addEventListener("click", () => {
+      // Oynatici: dosyayi sunucudan akitarak sol ustteki oynaticida gosterir.
+      // (Indirme YOK; bu yuzden yarim dosya / zaman asimi sorunu da yok.)
+      $("playRendered")?.addEventListener("click", () => {
         const v = $("video");
-        $("syncToggle").checked = false; // islenmis video kendi hizinda oynar
+        $("syncToggle").checked = false;
         v.src = url; v.load(); v.play();
+      });
+      // Klasoru ac: sunucu, dosyanin bulundugu klasoru Windows Gezgini'nde acar
+      $("openFolder")?.addEventListener("click", async () => {
+        try { await fetch(`${API_BASE}/open-output-folder`, { method: "POST" }); }
+        catch { alert("Klasor: " + diskYol); }
+      });
+      // Yola tikla -> panoya kopyala
+      $("diskPath")?.addEventListener("click", () => {
+        navigator.clipboard?.writeText(diskYol);
+        $("diskPath").innerHTML = "Yol panoya kopyalandı ✓";
       });
     }, 0);
   }
@@ -619,6 +630,9 @@ function drawPlayers() {
     // Lerp: konumu hedefe yumusakca kaydir (isinlanma hissini onler)
     p.x += (p.tx - p.x) * LERP_K;
     p.y += (p.ty - p.y) * LERP_K;
+    // Birkac karedir gorunmeyen oyuncu soluklasarak kaybolur (ani silinme yok)
+    const missing = currentKare - p.lastKare;
+    ctx.globalAlpha = missing <= 1 ? 1 : Math.max(0.25, 1 - 0.09 * missing);
     const X = sx(p.x), Y = sy(p.y);
     ctx.beginPath();
     ctx.arc(X, Y, 9, 0, Math.PI * 2);
@@ -631,6 +645,7 @@ function drawPlayers() {
     ctx.fillStyle = "#0b0f0d";
     ctx.fillText("#" + id, X, Y + 3.5);
   }
+  ctx.globalAlpha = 1;
 }
 
 function drawBall() {
@@ -675,6 +690,12 @@ function bindToggle(btnId, key) {
 bindToggle("tglVoronoi", "voronoi");
 bindToggle("tglHeat", "heat");
 bindToggle("tglTrail", "trail");
+
+// Uzun dosya yolunu kisalt: ...\son_iki_klasor\dosya.mp4
+function shortenPath(p) {
+  const parts = String(p).split(/[\\/]/);
+  return parts.length > 2 ? "...\\" + parts.slice(-2).join("\\") : p;
+}
 
 function setConn(state, text) {
   const el = $("conn");

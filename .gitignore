@@ -1,10 +1,30 @@
-# Sanal ortamı gizle
+# Gizli anahtarlar (API key, token) - ASLA commit'leme
+.env
+.env.*
+!.env.example
+
+# Sanal ortam ve Python ara dosyalari
 .venv/
+venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# Büyük video dosyalarını ve geçici dosyaları gizle
+# Buyuk video dosyalari (ornek videolar test_videolarini_indir.py ile indirilir)
 *.mp4
 *.avi
 *.mov
 *.mkv
+
+# Analiz ciktilari (sunucu calisirken otomatik olusur)
+footballiq_ciktilar/
+
+# Indirilen model agirliklari
+*.pt
+*.onnx
+
+# Editor / isletim sistemi dosyalari
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

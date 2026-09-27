@@ -46,6 +46,8 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import traceback
 import uuid
@@ -77,14 +79,24 @@ from sports.configs.soccer import SoccerPitchConfiguration
 
 # ----------------------------------------------------------------------------
 # API ANAHTARLARI
-# Anahtarlari koda yazma; terminalden veya .env'den tanimla.
-# setdefault: sistemde tanimliysa onu kullanir, degilse buradakini.
+# Anahtarlar koda YAZILMAZ; proje klasorundeki .env dosyasindan (bkz.
+# .env.example) veya sistem ortam degiskenlerinden okunur.
 # ----------------------------------------------------------------------------
-os.environ.setdefault("HF_TOKEN", "BURAYA_YENI_HF_TOKEN")
-os.environ.setdefault("ROBOFLOW_API_KEY", "BURAYA_YENI_ROBOFLOW_KEY")
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass  # python-dotenv yoksa sadece sistem ortam degiskenleri kullanilir
+
 os.environ["ONNXRUNTIME_EXECUTION_PROVIDERS"] = "[CPUExecutionProvider]"
 
-ROBOFLOW_API_KEY = os.environ["ROBOFLOW_API_KEY"]
+ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY")
+if not ROBOFLOW_API_KEY:
+    sys.exit(
+        "ROBOFLOW_API_KEY tanimli degil. .env.example dosyasini .env olarak "
+        "kopyalayip kendi anahtarini yaz."
+    )
 
 torch.set_default_device("cpu")
 DEVICE = "cpu"
@@ -111,8 +123,22 @@ REFEREE_ID = 3
 # SoccerPitchConfiguration santimetre kullanir (saha 12000 x 7000 cm).
 # ----------------------------------------------------------------------------
 CONTROL_DISTANCE_CM = 200        # 2.0 m: top bu mesafede ise oyuncu "kontrolde"
-MIN_PASS_DISTANCE_CM = 800       # 8 m altindaki top hareketi pas sayilmaz
-MIN_CONTROL_FRAMES = 3           # Oyuncunun topu "aldi" sayilmasi icin gereken kare
+MIN_PASS_DISTANCE_CM = 300       # 3 m altindaki top hareketi pas sayilmaz.
+                                 # (8 m cok yuksekti: futboldaki kisa paslarin cogu
+                                 # 8 m altinda kaliyor ve sayilmiyordu. ID kayma
+                                 # artiklarini artik ID koprusu temizledigi icin
+                                 # bu esik gercek pas filtrelemek zorunda degil.)
+MIN_CONTROL_FRAMES = 2           # Oyuncunun topu "aldi" sayilmasi icin gereken kare
+                                 # (3 idi; stride'li 8 fps akista tek dokunus
+                                 # paslarini kaciriyordu)
+
+# --- ID KOPRUSU (kararli kimlik) -----------------------------------------------
+# ByteTrack ayni oyuncuya yeni numara verdiginde, kopru "az once yakinimda
+# kaybolan ayni takimdan numara var mi" diye bakar ve eski numarayi geri baglar.
+ID_BRIDGE_BASE_RADIUS_CM = 150   # Eslestirme icin taban yaricap
+ID_BRIDGE_CM_PER_FRAME = 120     # Kayip gecen her islenen kare basina ek yaricap
+                                 # (sprint hizi ~9 m/s -> 8 fps'te ~110 cm/kare)
+ID_BRIDGE_MAX_RADIUS_CM = 1200   # Yaricap ust siniri (12 m)
 HOMOGRAPHY_WINDOW = 5            # 5 karelik homografi matrisi ortalamasi
 KEYPOINT_CONF_THRESHOLD = 0.5
 DETECTION_CONF = 0.3
@@ -133,9 +159,11 @@ MIN_CONSECUTIVE_FRAMES = 1       # 1 = filtre kapali. DIKKAT: 3 denendi ve geri
                                  # tepti: hizli kosan gercek oyuncular elendi,
                                  # sabit duran kulube/personel kaldi. Hayalet
                                  # tespitler artik saha siniri filtresiyle eleniyor.
-PITCH_MARGIN_CM = 200            # Kusbakisi konumu saha disina bu payin otesinde
+PITCH_MARGIN_CM = 350            # Kusbakisi konumu saha disina bu payin otesinde
                                  # dusen tespitler (yedek kulubesi, kenar personeli,
                                  # tribun) radara ve istatistige ALINMAZ.
+                                 # (200 idi; homografinin en az guvenilir oldugu tac
+                                 # cizgisinde gercek oyunculari ara ara eliyordu.)
 
 # --- HIZLANDIRMA PARAMETRELERI -----------------------------------------------
 FIELD_DETECT_EVERY = 1           # 1 = her karede (dogru sonuc). 3 denendi:
@@ -233,6 +261,83 @@ class PlayerTracker:
         return detections[tracker_ids != -1]
 
 
+class StableIDMapper:
+    """
+    ID KOPRUSU: Ham takipci (ByteTrack/BoT-SORT) numaralarini KARARLI numaralara
+    cevirir. ByteTrack bir oyuncuyu kaybedip yeni numara actiginda, kopru son
+    LOST_TRACK_SECONDS icinde yakinlarda kaybolan AYNI TAKIMDAN bir kararli
+    numara arar; bulursa eski numarayi geri verir. Boylece:
+      - Radar ve MP4 etiketlerinde numaralar 90'lara firlamaz,
+      - Pas motoru "yeni oyuncu" yanilgisiyla gercek paslari yutmaz.
+    Tum mesafeler kusbakisi saha koordinatinda (cm) olculur.
+    """
+
+    def __init__(self, effective_fps: float):
+        self.raw_to_stable: Dict[int, int] = {}
+        # stable_id -> {"xy": son konum, "team": takim, "frame": son gorulme}
+        self.last_seen: Dict[int, dict] = {}
+        self.next_id = 1
+        self.max_gap_frames = max(2, int(LOST_TRACK_SECONDS * effective_fps))
+
+    def update(
+        self,
+        raw_ids: np.ndarray,
+        pitch_xy: np.ndarray,
+        teams: np.ndarray,
+        frame_idx: int,
+    ) -> np.ndarray:
+        stable_ids = np.zeros(len(raw_ids), dtype=int)
+        used_this_frame = set()
+
+        for i, raw in enumerate(raw_ids):
+            raw = int(raw)
+            sid = self.raw_to_stable.get(raw)
+
+            if sid is None:
+                # Yeni ham numara: yakin zamanda kaybolan kararli numara ara
+                best_sid, best_dist = None, float("inf")
+                for cand, info in self.last_seen.items():
+                    if cand in used_this_frame:
+                        continue
+                    gap = frame_idx - info["frame"]
+                    if gap <= 0 or gap > self.max_gap_frames:
+                        continue
+                    if info["team"] != int(teams[i]):
+                        continue
+                    allowed = min(
+                        ID_BRIDGE_MAX_RADIUS_CM,
+                        ID_BRIDGE_BASE_RADIUS_CM + ID_BRIDGE_CM_PER_FRAME * gap,
+                    )
+                    dist = float(np.linalg.norm(pitch_xy[i] - info["xy"]))
+                    if dist <= allowed and dist < best_dist:
+                        best_sid, best_dist = cand, dist
+                sid = best_sid if best_sid is not None else self.next_id
+                if best_sid is None:
+                    self.next_id += 1
+                self.raw_to_stable[raw] = sid
+
+            # Ayni karede iki tespite ayni kararli numara verilmesin
+            if sid in used_this_frame:
+                sid = self.next_id
+                self.next_id += 1
+                self.raw_to_stable[raw] = sid
+
+            used_this_frame.add(sid)
+            stable_ids[i] = sid
+            self.last_seen[sid] = {
+                "xy": pitch_xy[i].copy(),
+                "team": int(teams[i]),
+                "frame": frame_idx,
+            }
+
+        # Hafiza temizligi: cok eski kayitlari at
+        stale = [s for s, inf in self.last_seen.items()
+                 if frame_idx - inf["frame"] > self.max_gap_frames * 3]
+        for s in stale:
+            self.last_seen.pop(s, None)
+        return stable_ids
+
+
 def resolve_goalkeepers_team_id(
     players: sv.Detections, goalkeepers: sv.Detections
 ) -> np.ndarray:
@@ -327,6 +432,7 @@ def analyze_video_stream(
     # Takipci, ISLENEN kare hizina gore kurulur (stride'in ID patlatmasini onler)
     effective_fps = fps / PROCESS_STRIDE
     tracker = PlayerTracker(effective_fps)
+    id_bridge = StableIDMapper(effective_fps)  # kararli kimlik koprusu
     frame_generator = sv.get_video_frames_generator(video_path, stride=PROCESS_STRIDE)
 
     # --- VideoSink: kaynak videonun cozunurlugunu kopyala, FPS'i stride'a bol.
@@ -470,6 +576,15 @@ def analyze_video_stream(
             pitch_players_xy = pitch_players_xy[in_pitch]
             team_ids = players.class_id
             tracker_ids = players.tracker_id
+
+            # --- 5.6) ID KOPRUSU: ham numaralari kararli numaralara cevir ----------
+            # Bundan sonraki her sey (pas motoru, radar paketi, MP4 etiketleri)
+            # kararli numaralari kullanir; ByteTrack'in numara sicramalari
+            # disariya yansimaz.
+            if tracker_ids is not None and len(tracker_ids) > 0:
+                tracker_ids = id_bridge.update(
+                    tracker_ids, pitch_players_xy, team_ids, frame_idx
+                )
 
             pitch_ball_xy = None
             if len(ball_detections) > 0:
@@ -859,6 +974,25 @@ def get_rendered_video(video_id: str):
     if path is None or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Islenmis video bulunamadi veya henuz hazir degil.")
     return FileResponse(path, media_type="video/mp4", filename="footballiq_analiz.mp4")
+
+
+@app.post("/open-output-folder")
+def open_output_folder():
+    """
+    Cikti klasorunu isletim sisteminin dosya yoneticisinde acar.
+    (Sunucu kullanicinin kendi bilgisayarinda calistigi icin guvenli; uzak
+    sunucuya tasirsan bu endpoint'i kaldir.)
+    """
+    try:
+        if os.name == "nt":  # Windows
+            os.startfile(OUTPUT_DIR)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":  # macOS
+            subprocess.Popen(["open", OUTPUT_DIR])
+        else:  # Linux
+            subprocess.Popen(["xdg-open", OUTPUT_DIR])
+        return {"durum": "acildi", "klasor": OUTPUT_DIR}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Klasor acilamadi: {e}")
 
 
 @app.post("/analyze")

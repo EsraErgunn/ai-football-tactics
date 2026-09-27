@@ -203,13 +203,3 @@ pytest test_footballiq.py -v
 pip install psutil
 python benchmark.py 08fd33_0.mp4 --strides 1 3 5
 ```
-
----
-
-## 🙏 Teşekkür
-
-Bu proje, [Roboflow](https://roboflow.com)'un açık kaynak
-[sports](https://github.com/roboflow/sports) deposu ve futbol analizi eğitim içerikleri
-temel alınarak geliştirilmiştir. Canlı WebSocket akışı, kararlı ID köprüsü, pas/top kaybı
-istatistikleri, Voronoi ve ısı haritası katmanları ile web paneli bu projeye eklenen
-özelliklerdir.
